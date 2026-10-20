@@ -64,6 +64,7 @@ use lance_index::scalar::{
     lance_format::LanceIndexStore,
 };
 use lance_index::{IndexCriteria, IndexType};
+use lance_select::RowAddrTreeMap;
 use lance_table::format::{Fragment, IndexMetadata};
 use log::info;
 use prost::{Message, Name};
@@ -143,6 +144,7 @@ pub(crate) async fn scan_training_data(
     column: &str,
     criteria: &TrainingCriteria,
     fragments: Option<Vec<Fragment>>,
+    physical_rows: Option<RowAddrTreeMap>,
 ) -> Result<SendableRecordBatchStream> {
     let num_rows = dataset.count_all_rows().await?;
 
@@ -173,6 +175,11 @@ pub(crate) async fn scan_training_data(
 
     if let Some(fragments) = fragments {
         scan.with_fragments(fragments);
+    }
+    // A physical selection restricts the scan to these rows of the selected
+    // fragments (the two intersect); the caller includes every row it wants.
+    if let Some(physical_rows) = physical_rows {
+        scan.with_physical_row_addr_prefilter(physical_rows);
     }
 
     let batches = scan
@@ -213,6 +220,7 @@ pub(crate) async fn load_training_data(
     fragments: Option<Vec<Fragment>>,
     train: bool,
     fragment_ids: Option<Vec<u32>>,
+    physical_rows: Option<RowAddrTreeMap>,
 ) -> Result<SendableRecordBatchStream> {
     // Create training request with fragment_ids if provided
     let training_request = Box::new(match fragment_ids.clone() {
@@ -246,9 +254,9 @@ pub(crate) async fn load_training_data(
                     Ok(frag.metadata().clone())
                 })
                 .collect();
-            scan_training_data(dataset, column, criteria, Some(frags?)).await
+            scan_training_data(dataset, column, criteria, Some(frags?), physical_rows).await
         } else {
-            scan_training_data(dataset, column, criteria, fragments).await
+            scan_training_data(dataset, column, criteria, fragments, physical_rows).await
         }
     } else {
         TrainingRequest::create_empty_stream(dataset, column, criteria).await
@@ -275,6 +283,7 @@ pub(crate) async fn load_fts_training_data(
         fragments,
         train,
         fragment_ids,
+        None,
     )
     .await?;
     if resolved.has_lists() {
@@ -491,6 +500,7 @@ pub(super) async fn build_scalar_index(
                 None,
                 train,
                 fragment_ids.clone(),
+                None,
             )
             .await?
         }
@@ -562,8 +572,16 @@ pub(super) async fn build_bitmap_index_segment(
     let criteria = training_request.criteria();
 
     progress.stage_start("load_data", None, "rows").await?;
-    let training_data =
-        load_training_data(dataset, column, criteria, None, true, Some(fragment_ids)).await?;
+    let training_data = load_training_data(
+        dataset,
+        column,
+        criteria,
+        None,
+        true,
+        Some(fragment_ids),
+        None,
+    )
+    .await?;
     progress.stage_complete("load_data").await?;
 
     let index_store = LanceIndexStore::from_dataset_for_new(dataset, &uuid)?;
@@ -1548,6 +1566,7 @@ mod tests {
             &TrainingCriteria::new(TrainingOrdering::Addresses).with_row_addr(),
             None,
             true,
+            None,
             None,
         )
         .await

@@ -8,6 +8,7 @@ use futures::{FutureExt, TryStreamExt};
 use lance_core::{Error, Result};
 use lance_file::reader::FileReaderOptions;
 use lance_file::versions::data_file_columns;
+use lance_index::scalar::zonemap::{ZoneMapIndex, ZoneMapIndexBuilderParams};
 use lance_index::{
     INDEX_FILE_NAME, IndexType,
     frag_reuse::CompactFragReuseIndex,
@@ -582,6 +583,7 @@ async fn load_unindexed_training_data(
         fragments,
         true,
         None,
+        None,
     )
     .await
 }
@@ -598,6 +600,26 @@ async fn rebuild_scalar_segment(
 ) -> Result<CreatedIndex> {
     let params = reference_index.derive_index_params()?;
     let update_criteria = reference_index.update_criteria();
+    // A zone map rebuild goes through the metadata-aware builder with the
+    // same fragment ids: it scans exactly those fragments (less what their
+    // seeds cover) and knows each fragment's physical row count, so its
+    // zones are cut at the configured boundaries even past deleted tails.
+    if let Some(zone_map) = reference_index.as_any().downcast_ref::<ZoneMapIndex>() {
+        let zone_map_params = serde_json::from_str::<ZoneMapIndexBuilderParams>(
+            params.params.as_deref().unwrap_or("{}"),
+        )?;
+        let index_store = LanceIndexStore::from_dataset_for_new(dataset, &uuid)?;
+        return crate::index::scalar::zonemap::build_segment_with_seeds(
+            dataset,
+            field_path,
+            zone_map_params,
+            zone_map.value_type(),
+            Some(fragment_ids),
+            &update_criteria.data_criteria,
+            &index_store,
+        )
+        .await;
+    }
     let training_data = load_training_data(
         dataset,
         field_path,
@@ -605,6 +627,7 @@ async fn rebuild_scalar_segment(
         None,
         true,
         Some(fragment_ids),
+        None,
     )
     .await?;
     super::scalar::build_scalar_index(
@@ -874,21 +897,24 @@ async fn merge_scalar_indices<'a>(
         let plugin = details.get_plugin()?;
         // Only open data files looking for seeds when the plugin confirms this
         // index type and configuration can actually produce them.
-        let maybe_created = if !plugin.might_use_seeds(&index_details) {
-            None
-        } else if index_type == IndexType::ZoneMap {
-            // Zone maps reuse the seeds of the fragments that have one and
-            // scan only the rest, in one segment write.
-            crate::index::scalar::zonemap::update_segment_with_seeds(
+        let maybe_created = if index_type == IndexType::ZoneMap {
+            // Zone maps go through the metadata-aware builder: zones are cut
+            // at the configured physical boundaries, seeds (when the index
+            // collects them) cover what they can, and the rest is scanned,
+            // in one segment write.
+            crate::index::scalar::zonemap::update_segment(
                 dataset.as_ref(),
                 &reference_index,
                 reference_idx,
                 field_path,
                 unindexed,
                 &update_criteria.data_criteria,
+                plugin.might_use_seeds(&index_details),
                 &new_store,
             )
             .await?
+        } else if !plugin.might_use_seeds(&index_details) {
+            None
         } else {
             if let Some(seeds) =
                 try_harvest_seeds(dataset.as_ref(), unindexed, reference_idx).await?

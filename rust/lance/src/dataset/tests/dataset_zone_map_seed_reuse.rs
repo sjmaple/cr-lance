@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Zone map builds reuse the write seeds fragments already carry, whatever
-//! record size those seeds were written with, and scan only the fragments
-//! without a usable seed. Every claim about what was reused or scanned is
+//! Zone map builds cut zones at the configured physical boundaries, reuse
+//! the write seeds fragments already carry where whole records fit a zone,
+//! and scan only the rows the seeds do not cover. Every claim about what was reused or scanned is
 //! taken from the build itself, and every query is compared with a plain
 //! scan by row identity.
 
@@ -16,12 +16,13 @@ use arrow_array::{
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance_core::utils::tempfile::TempStrDir;
 use lance_file::reader::{FileReader, FileReaderOptions};
+use lance_file::version::LanceFileVersion;
 use lance_index::IndexType;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::pbold;
 use lance_index::scalar::seed::SEED_META_KEY_PREFIX;
-use lance_index::scalar::zonemap::ZoneMapIndex;
+use lance_index::scalar::zonemap::{ZoneMapIndex, ZoneSummary};
 use lance_index::scalar::{BuiltinIndexType, SargableQuery, ScalarIndexParams};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
@@ -351,411 +352,284 @@ fn pages_per_fragment(
         .collect()
 }
 
-fn totals(per_file: &HashMap<String, (u64, u64)>) -> (u64, u64) {
-    per_file
-        .values()
-        .fold((0, 0), |acc, v| (acc.0 + v.0, acc.1 + v.1))
-}
-
-/// Seeds written for an 8-row index fold into one 20000-row zone per fragment
-/// at creation, without reading those fragments' values.
-#[tokio::test]
-async fn test_create_index_packs_smaller_seed_records_into_large_zones() {
-    let dir = TempStrDir::default();
-    let mut dataset = write(dir.as_str(), 0..N).await;
-    create_index(&mut dataset, "val", &zone_map_params(64, true, true), None).await;
-    for k in 1..6 {
-        append(&mut dataset, k * N..(k + 1) * N).await;
-    }
-    assert_eq!(
-        seed_locator(&dataset, 3, "val")
-            .await
-            .as_deref()
-            .unwrap()
-            .split(':')
-            .nth(1),
-        Some("64")
-    );
-    dataset.drop_index(&index_name("val")).await.unwrap();
-
-    io(&dataset);
-    let (_, reports) = with_reports(create_index(
+/// Seeds written with `record_rows` by an index on `column` for every
+/// fragment but the first: create a small seeded index on the first
+/// fragment, then append `appends` fragments.
+async fn seeded_dataset(uri: &str, record_rows: u64, appends: i32, bitmap: bool) -> Dataset {
+    let mut dataset = write(uri, 0..N).await;
+    create_index(
         &mut dataset,
         "val",
-        &zone_map_params(20000, true, true),
+        &zone_map_params(record_rows, true, bitmap),
+        None,
+    )
+    .await;
+    for k in 1..=appends {
+        append(&mut dataset, k * N..(k + 1) * N).await;
+    }
+    dataset
+}
+
+/// The same data written without any index.
+async fn unseeded_dataset(uri: &str, appends: i32) -> Dataset {
+    let mut dataset = write(uri, 0..N).await;
+    for k in 1..=appends {
+        append(&mut dataset, k * N..(k + 1) * N).await;
+    }
+    dataset
+}
+
+async fn zone_summaries(dataset: &Dataset, column: &str) -> Vec<ZoneSummary> {
+    let segments = index_metadata(dataset, column).await;
+    let mut out = Vec::new();
+    for segment in &segments {
+        let index = dataset
+            .open_scalar_index(column, &segment.uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        out.extend(
+            index
+                .as_any()
+                .downcast_ref::<ZoneMapIndex>()
+                .unwrap()
+                .zone_summaries(),
+        );
+    }
+    out.sort_by_key(|z| (z.bound.fragment_id, z.bound.start));
+    out
+}
+
+fn layout(zones: &[ZoneSummary]) -> Vec<(u64, u64, usize)> {
+    zones
+        .iter()
+        .map(|z| (z.bound.fragment_id, z.bound.start, z.bound.length))
+        .collect()
+}
+
+/// The configured layout of a fragment of `rows` physical rows.
+fn target_layout(fragment: u64, rows: u64, t: u64) -> Vec<(u64, u64, usize)> {
+    (0..rows.div_ceil(t))
+        .map(|k| {
+            (
+                fragment,
+                k * t,
+                ((k + 1) * t).min(rows) as usize - (k * t) as usize,
+            )
+        })
+        .collect()
+}
+
+/// Rows of a fragment of `rows` rows with `s`-row seed records that must be
+/// scanned for target zones of `t`: the records crossing a boundary.
+fn crossing_rows(rows: u64, s: u64, t: u64) -> u64 {
+    let mut scanned = 0;
+    let mut start = 0;
+    while start < rows {
+        let end = (start + s).min(rows);
+        if start / t != (end - 1) / t {
+            scanned += end - start;
+        }
+        start = end;
+    }
+    scanned
+}
+
+/// Seed-assisted builds cut exactly the configured zones and produce the
+/// same statistics as a plain scan of the same data, for divisible,
+/// non-divisible, whole-fragment and phase-shifting target sizes, with and
+/// without a null bitmap. Reads are attributed per fragment file.
+#[rstest::rstest]
+#[case::divisible(64, 320, true)]
+#[case::whole_fragment(64, 20000, true)]
+#[case::whole_fragment_no_bitmap(64, 20000, false)]
+#[case::non_divisible(64, 100, true)]
+#[case::phase_shifting(64, 10000, false)]
+#[case::same_size(64, 64, true)]
+#[tokio::test]
+async fn test_create_index_keeps_configured_boundaries(
+    #[case] s: u64,
+    #[case] t: u64,
+    #[case] bitmap: bool,
+) {
+    let seeded_dir = TempStrDir::default();
+    let mut seeded = seeded_dataset(seeded_dir.as_str(), s, 5, bitmap).await;
+    let control_dir = TempStrDir::default();
+    let mut control = unseeded_dataset(control_dir.as_str(), 5).await;
+
+    io(&seeded);
+    let (_, reports) = with_reports(create_index(
+        &mut seeded,
+        "val",
+        &zone_map_params(t, true, bitmap),
         None,
     ))
     .await;
-    let reuse_io = io(&dataset);
-    let reuse_reads = classify_data_file_reads(&dataset, &reuse_io).await;
-    let (reuse_pages, reuse_other) = totals(&reuse_reads);
-    // Per fragment: a reused fragment's file contributes no column page
-    // reads. Opening a file prefetches a fixed-size tail that can overlap
-    // the end of the last page by under 4 KiB; that prefetch is the only
-    // page-region byte a reused fragment may show.
-    for (fragment, pages) in pages_per_fragment(&dataset, "val", &reuse_reads) {
-        if fragment == 0 {
+    let seeded_reads = classify_data_file_reads(&seeded, &io(&seeded)).await;
+    io(&control);
+    create_index(&mut control, "val", &zone_map_params(t, true, bitmap), None).await;
+    let control_reads = classify_data_file_reads(&control, &io(&control)).await;
+
+    // Layout and statistics identical to the scan, zones exactly the target.
+    let from_seeds = zone_summaries(&seeded, "val").await;
+    let from_scan = zone_summaries(&control, "val").await;
+    assert_eq!(from_seeds, from_scan, "{s} -> {t}");
+    let expected: Vec<(u64, u64, usize)> = (0..6u64)
+        .flat_map(|f| target_layout(f, N as u64, t))
+        .collect();
+    assert_eq!(layout(&from_seeds), expected);
+
+    // The report matches the interval arithmetic: fragment 0 (no seed) is
+    // scanned whole, the others reuse whole records and scan crossings.
+    let report = &reports[0];
+    let crossing = crossing_rows(N as u64, s, t);
+    assert_eq!(report.scanned_rows, N as u64 + 5 * crossing, "{s} -> {t}");
+    if crossing == 0 {
+        assert_eq!(report.reused_fragments, vec![1, 2, 3, 4, 5]);
+        assert_eq!(report.scanned_fragments, vec![0]);
+    } else if crossing == N as u64 {
+        assert!(report.reused_fragments.is_empty());
+        assert_eq!(report.scanned_fragments, vec![0, 1, 2, 3, 4, 5]);
+    } else {
+        assert_eq!(report.partial_fragments, vec![1, 2, 3, 4, 5]);
+        assert_eq!(report.scanned_fragments, vec![0, 1, 2, 3, 4, 5]);
+    }
+    assert!(report.masked);
+    assert!(report.max_live_seed_bytes * 4 <= report.total_seed_bytes);
+
+    // Column pages: the unseeded fragment reads its pages; a fully reused
+    // fragment reads none (below the file-open tail prefetch); a partially
+    // reused one reads fewer than the all-scan control read for the same file.
+    let seeded_pages = pages_per_fragment(&seeded, "val", &seeded_reads);
+    let control_pages = pages_per_fragment(&control, "val", &control_reads);
+    for ((fragment, pages), (_, full)) in seeded_pages.iter().zip(&control_pages) {
+        if *fragment == 0 {
+            assert!(*pages > 4096, "fragment 0 scanned: {pages}");
+        } else if crossing == 0 {
             assert!(
-                pages > 4096,
-                "the unseeded fragment is scanned: {pages} page bytes"
+                *pages < 4096,
+                "fragment {fragment} reused but read {pages} page bytes"
             );
-        } else {
+        } else if crossing < N as u64 {
             assert!(
-                pages < 4096,
-                "fragment {fragment} was reused but {pages} page bytes were read"
+                *pages < *full,
+                "fragment {fragment}: partial {pages} vs full {full}"
             );
         }
     }
-    assert_eq!(reports.len(), 1);
-    assert_eq!(reports[0].reused_fragments, vec![1, 2, 3, 4, 5]);
-    assert_eq!(reports[0].reused_records, 5 * (N as usize / 64 + 1));
-    assert_eq!(reports[0].zones_from_seeds, 5);
-    assert_eq!(reports[0].scanned_fragments, vec![0]);
-    // Raw seed buffers are owned one fragment at a time: the most ever
-    // owned at once is one seed, far below the five harvested in total.
-    assert!(reports[0].max_live_seed_bytes > 0);
-    assert!(
-        reports[0].max_live_seed_bytes * 4 <= reports[0].total_seed_bytes,
-        "live {} of {} total seed bytes",
-        reports[0].max_live_seed_bytes,
-        reports[0].total_seed_bytes
-    );
-
-    let segments = index_metadata(&dataset, "val").await;
-    assert_eq!(details(&segments[0]).rows_per_zone, Some(20000));
-    assert_eq!(details(&segments[0]).has_null_bitmap, Some(true));
-    assert_eq!(coverage(&segments[0]), RoaringBitmap::from_iter(0..6u32));
-    assert_index_matches_scan(&dataset, VAL_FILTERS).await;
-
-    // Control: the same table written without any index has no seeds, so
-    // the same build scans every fragment.
-    let control_dir = TempStrDir::default();
-    let mut control = write(control_dir.as_str(), 0..N).await;
-    for k in 1..6 {
-        append(&mut control, k * N..(k + 1) * N).await;
+    assert_index_matches_scan_with(&seeded, VAL_FILTERS, bitmap).await;
+    if bitmap {
+        let segments = index_metadata(&seeded, "val").await;
+        let index = seeded
+            .open_scalar_index("val", &segments[0].uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let result = index
+            .search(&SargableQuery::IsNull(), &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert!(result.is_exact());
     }
-    io(&control);
-    let (_, reports) = with_reports(create_index(
-        &mut control,
-        "val",
-        &zone_map_params(20000, true, true),
-        None,
-    ))
-    .await;
-    let control_io = io(&control);
-    let (control_pages, control_other) =
-        totals(&classify_data_file_reads(&control, &control_io).await);
-    assert!(reports[0].reused_fragments.is_empty());
-    assert_eq!(reports[0].scanned_fragments, vec![0, 1, 2, 3, 4, 5]);
-    // Only the one scanned fragment's column pages are read; the five reused
-    // fragments cost footer and seed bytes only.
-    assert!(
-        reuse_pages * 4 <= control_pages,
-        "column pages: reuse read {reuse_pages} bytes, scanning all six read {control_pages}"
-    );
-    log::info!(
-        "SEED_REUSE_IO reuse: pages={reuse_pages} footer_and_seeds={reuse_other} total={}; \
-         scan_all: pages={control_pages} footer_and_seeds={control_other} total={}",
-        reuse_io.read_bytes,
-        control_io.read_bytes
-    );
-    assert_index_matches_scan(&control, VAL_FILTERS).await;
 }
 
-/// An update folds seeds of two different record sizes into a 20000-row
-/// index and keeps the exact null positions they carry.
+/// A fragment smaller than the target is one zone from its records; a seed
+/// record larger than the target is never reused.
 #[tokio::test]
-async fn test_update_reuses_seeds_of_any_record_size() {
+async fn test_fragment_smaller_than_target_and_seed_larger_than_target() {
     let dir = TempStrDir::default();
-    let mut dataset = write(dir.as_str(), 0..N).await;
-    create_index(&mut dataset, "val", &zone_map_params(8, true, true), None).await;
-    append(&mut dataset, N..2 * N).await;
-    append(&mut dataset, 2 * N..3 * N).await;
-    // Replace the index over fragment 0 only: fragments 1 and 2 keep their
-    // 8-row seeds and are unindexed for the new index.
-    create_index(
-        &mut dataset,
-        "val",
-        &zone_map_params(20000, true, true),
-        Some(vec![0]),
-    )
-    .await;
-    append(&mut dataset, 3 * N..4 * N).await;
-    assert_eq!(
-        seed_locator(&dataset, 1, "val")
-            .await
-            .as_deref()
-            .unwrap()
-            .split(':')
-            .nth(1),
-        Some("8")
-    );
-    assert_eq!(
-        seed_locator(&dataset, 3, "val")
-            .await
-            .as_deref()
-            .unwrap()
-            .split(':')
-            .nth(1),
-        Some("8192")
-    );
-
-    let (_, reports) = with_reports(async {
-        dataset
-            .optimize_indices(&OptimizeOptions::default())
-            .await
-            .unwrap();
-    })
-    .await;
-    assert_eq!(reports.len(), 1);
-    assert_eq!(reports[0].reused_fragments, vec![1, 2, 3]);
-    assert_eq!(reports[0].reused_records, 2 * (N as usize / 8) + 3);
-    assert_eq!(reports[0].zones_from_seeds, 3);
-    assert!(reports[0].scanned_fragments.is_empty());
-
-    let segments = index_metadata(&dataset, "val").await;
-    assert_eq!(segments.len(), 1);
-    assert_eq!(coverage(&segments[0]), RoaringBitmap::from_iter(0..4u32));
-    assert_eq!(details(&segments[0]).has_null_bitmap, Some(true));
-    assert_index_matches_scan(&dataset, VAL_FILTERS).await;
-    let index = dataset
-        .open_scalar_index("val", &segments[0].uuid, &NoOpMetricsCollector)
-        .await
-        .unwrap();
-    let result = index
-        .search(&SargableQuery::IsNull(), &NoOpMetricsCollector)
-        .await
-        .unwrap();
-    assert!(result.is_exact(), "IS NULL stays exact after a seed update");
-    assert_eq!(
-        index
-            .as_any()
-            .downcast_ref::<ZoneMapIndex>()
-            .unwrap()
-            .num_zones(),
-        4
-    );
-}
-
-/// A fragment without a seed is scanned while its seeded siblings are not.
-#[tokio::test]
-async fn test_update_scans_only_fragments_without_a_seed() {
-    let dir = TempStrDir::default();
-    let mut dataset = write(dir.as_str(), 0..N).await;
-    create_index(&mut dataset, "val", &zone_map_params(16, true, true), None).await;
-    append(&mut dataset, N..2 * N).await;
-    dataset.drop_index(&index_name("val")).await.unwrap();
-    append(&mut dataset, 2 * N..3 * N).await;
-    assert!(seed_locator(&dataset, 2, "val").await.is_none());
-    create_index(
-        &mut dataset,
-        "val",
-        &zone_map_params(16, true, true),
-        Some(vec![0]),
-    )
-    .await;
-
-    let (_, reports) = with_reports(async {
-        dataset
-            .optimize_indices(&OptimizeOptions::default())
-            .await
-            .unwrap();
-    })
-    .await;
-    assert_eq!(reports[0].reused_fragments, vec![1]);
-    assert_eq!(reports[0].scanned_fragments, vec![2]);
-    let segments = index_metadata(&dataset, "val").await;
-    assert_eq!(coverage(&segments[0]), RoaringBitmap::from_iter(0..3u32));
-    assert_eq!(details(&segments[0]).has_null_bitmap, Some(true));
-    assert_index_matches_scan(&dataset, VAL_FILTERS).await;
-}
-
-/// `store_null_bitmap: false` survives creation, updates and parameter
-/// derivation, and null predicates stay correct through a recheck.
-#[tokio::test]
-async fn test_index_without_null_bitmap() {
-    let dir = TempStrDir::default();
-    let mut dataset = write(dir.as_str(), 0..N).await;
-    create_index(
-        &mut dataset,
-        "val",
-        &zone_map_params(100, true, false),
-        None,
-    )
-    .await;
-    let segments = index_metadata(&dataset, "val").await;
-    assert_eq!(details(&segments[0]).has_null_bitmap, Some(false));
-    assert_index_matches_scan_with(&dataset, VAL_FILTERS, false).await;
-
-    // Appends reuse seeds and keep the setting.
-    append(&mut dataset, N..2 * N).await;
-    let (_, reports) = with_reports(async {
-        dataset
-            .optimize_indices(&OptimizeOptions::default())
-            .await
-            .unwrap();
-    })
-    .await;
-    assert_eq!(reports[0].reused_fragments, vec![1]);
-    let segments = index_metadata(&dataset, "val").await;
-    assert_eq!(details(&segments[0]).has_null_bitmap, Some(false));
-    let index = dataset
-        .open_scalar_index("val", &segments[0].uuid, &NoOpMetricsCollector)
-        .await
-        .unwrap();
-    let zone_map = index.as_any().downcast_ref::<ZoneMapIndex>().unwrap();
-    assert!(!zone_map.store_null_bitmap());
-    assert!(!zone_map.has_null_bitmap());
-    let result = index
-        .search(&SargableQuery::IsNull(), &NoOpMetricsCollector)
-        .await
-        .unwrap();
-    assert!(!result.is_exact());
-    let derived = index.derive_index_params().unwrap();
-    assert!(
-        derived
-            .params
-            .unwrap()
-            .contains("\"store_null_bitmap\":false")
-    );
-    assert_index_matches_scan_with(&dataset, VAL_FILTERS, false).await;
-
-    // A rebuild from derived parameters keeps the setting too.
-    append(&mut dataset, 2 * N..3 * N).await;
-    dataset
-        .optimize_indices(&OptimizeOptions::new().num_indices_to_merge(Some(0)))
-        .await
-        .unwrap();
-    dataset
-        .optimize_indices(&OptimizeOptions::new().num_indices_to_merge(Some(2)))
-        .await
-        .unwrap();
-    let segments = index_metadata(&dataset, "val").await;
-    assert_eq!(segments.len(), 1);
-    assert_eq!(details(&segments[0]).has_null_bitmap, Some(false));
-    assert_eq!(coverage(&segments[0]), RoaringBitmap::from_iter(0..3u32));
-    assert_index_matches_scan_with(&dataset, VAL_FILTERS, false).await;
-}
-
-/// Seeds describe physical rows. A fragment with deletions, including one
-/// whose live rows are all null, is still summarized from its seed and the
-/// index stays a superset of the live matches.
-#[tokio::test]
-async fn test_seed_reuse_with_deleted_rows() {
-    let dir = TempStrDir::default();
-    let mut dataset = write(dir.as_str(), 0..N).await;
-    create_index(&mut dataset, "val", &zone_map_params(8, true, true), None).await;
-    append(&mut dataset, N..2 * N).await;
-    append(&mut dataset, 2 * N..3 * N).await;
-    // Fragment 1: delete every third row, and every non-null row of its first
-    // hundred ids
-    // so the survivors of that range are all null.
-    dataset.delete("id % 3 = 0").await.unwrap();
-    dataset
-        .delete(&format!(
-            "id >= {N} AND id < {} AND val IS NOT NULL",
-            N + 100
-        ))
-        .await
-        .unwrap();
-    // Fragment 2: delete everything, which removes the fragment.
-    dataset.delete(&format!("id >= {}", 2 * N)).await.unwrap();
-    assert_eq!(dataset.fragments().len(), 2);
-    let physical: u64 = dataset.fragments()[1].physical_rows.unwrap() as u64;
-    assert_eq!(physical, N as u64);
-    dataset.drop_index(&index_name("val")).await.unwrap();
-
+    let mut dataset = seeded_dataset(dir.as_str(), 64, 2, true).await;
     let (_, reports) = with_reports(create_index(
         &mut dataset,
         "val",
-        &zone_map_params(20000, true, true),
+        &zone_map_params(50_000, true, true),
         None,
-    ))
-    .await;
-    assert_eq!(reports[0].reused_fragments, vec![1]);
-    assert_eq!(reports[0].scanned_fragments, vec![0]);
-    let segments = index_metadata(&dataset, "val").await;
-    assert_eq!(coverage(&segments[0]), RoaringBitmap::from_iter([0u32, 1]));
-    assert_index_matches_scan(
-        &dataset,
-        &[
-            "val IS NULL",
-            "val IS NOT NULL",
-            "val > 0",
-            "val < 0",
-            &format!("id >= {N} AND id < {} AND val IS NOT NULL", N + 100),
-            "val IN (14, 20000, 8191)",
-        ],
-    )
-    .await;
-}
-
-/// Creating over a subset of fragments harvests and covers only that subset.
-#[tokio::test]
-async fn test_subset_creation_stays_within_the_requested_fragments() {
-    let dir = TempStrDir::default();
-    let mut dataset = write(dir.as_str(), 0..N).await;
-    create_index(&mut dataset, "val", &zone_map_params(8, true, true), None).await;
-    append(&mut dataset, N..2 * N).await;
-    append(&mut dataset, 2 * N..3 * N).await;
-    dataset.drop_index(&index_name("val")).await.unwrap();
-    let (_, reports) = with_reports(create_index(
-        &mut dataset,
-        "val",
-        &zone_map_params(20000, true, true),
-        Some(vec![1, 2]),
     ))
     .await;
     assert_eq!(reports[0].reused_fragments, vec![1, 2]);
-    assert!(reports[0].scanned_fragments.is_empty());
-    let segments = index_metadata(&dataset, "val").await;
-    assert_eq!(coverage(&segments[0]), RoaringBitmap::from_iter([1u32, 2]));
+    assert_eq!(reports[0].scanned_fragments, vec![0]);
+    assert_eq!(
+        layout(&zone_summaries(&dataset, "val").await),
+        vec![(0, 0, N as usize), (1, 0, N as usize), (2, 0, N as usize)]
+    );
     assert_index_matches_scan(&dataset, VAL_FILTERS).await;
-}
 
-/// Seed records are never larger than the default zone size, so a seed
-/// written for a large-zone index still serves a smaller one later.
-#[tokio::test]
-async fn test_seed_records_are_capped_at_the_default_zone_size() {
-    let dir = TempStrDir::default();
-    let mut dataset = write(dir.as_str(), 0..N).await;
-    create_index(
+    let (_, reports) = with_reports(create_index(
         &mut dataset,
         "val",
-        &zone_map_params(1_000_000, true, true),
+        &zone_map_params(32, true, true),
         None,
-    )
+    ))
     .await;
-    append(&mut dataset, N..2 * N).await;
+    // Seed records larger than the target: no full record fits a zone. The
+    // short tail record [19968, 20000) of each seeded fragment is the one
+    // exception (32 rows, exactly zone 624), so those fragments are partial
+    // with all other rows scanned.
+    assert!(reports[0].reused_fragments.is_empty());
+    assert_eq!(reports[0].partial_fragments, vec![1, 2]);
+    assert_eq!(reports[0].scanned_fragments, vec![0, 1, 2]);
+    assert_eq!(reports[0].scanned_rows, 3 * N as u64 - 2 * 32);
+    assert_eq!(reports[0].reused_records, 2);
     assert_eq!(
-        seed_locator(&dataset, 1, "val")
-            .await
-            .as_deref()
-            .unwrap()
-            .split(':')
-            .nth(1),
-        Some("8192")
+        layout(&zone_summaries(&dataset, "val").await),
+        (0..3u64)
+            .flat_map(|f| target_layout(f, N as u64, 32))
+            .collect::<Vec<_>>()
     );
-    create_index(
-        &mut dataset,
-        "name",
-        &zone_map_params(100, true, true),
-        None,
-    )
-    .await;
-    append(&mut dataset, 2 * N..3 * N).await;
-    assert_eq!(
-        seed_locator(&dataset, 2, "name")
-            .await
-            .as_deref()
-            .unwrap()
-            .split(':')
-            .nth(1),
-        Some("100")
-    );
+}
 
-    // 8192-row records do not fit 1000-row zones, so a 1000-row index scans.
-    dataset.drop_index(&index_name("val")).await.unwrap();
+/// Deletions: a deleted fragment is reused only when every zone comes from
+/// whole records (physical population), scanned whole when a crossing
+/// record would need a partial scan, and a plain scan keeps the configured
+/// boundaries past a deleted tail.
+#[tokio::test]
+async fn test_deletions_keep_boundaries_and_populations_apart() {
+    let dir = TempStrDir::default();
+    let mut dataset = seeded_dataset(dir.as_str(), 64, 2, true).await;
+    // Fragment 1: a hole inside a record; fragment 2: the whole physical tail
+    // (last 1,000 rows) and every third row.
+    dataset
+        .delete(&format!("id >= {} AND id < {}", N + 100, N + 150))
+        .await
+        .unwrap();
+    dataset
+        .delete(&format!(
+            "id >= {} OR (id >= {} AND id % 3 = 0)",
+            3 * N - 1000,
+            2 * N
+        ))
+        .await
+        .unwrap();
+    assert!(dataset.fragments()[1].deletion_file.is_some());
+    assert!(dataset.fragments()[2].deletion_file.is_some());
+
+    // Divisible target: both deleted fragments fully from seeds (physical).
+    let (_, reports) = with_reports(create_index(
+        &mut dataset,
+        "val",
+        &zone_map_params(640, true, true),
+        None,
+    ))
+    .await;
+    assert_eq!(reports[0].reused_fragments, vec![1, 2]);
+    assert_eq!(reports[0].scanned_fragments, vec![0]);
+    let zones = zone_summaries(&dataset, "val").await;
+    assert_eq!(
+        layout(&zones),
+        (0..3u64)
+            .flat_map(|f| target_layout(f, N as u64, 640))
+            .collect::<Vec<_>>()
+    );
+    // Physical counts: fragment 2's tail zone still has its seed's nulls.
+    let tail = zones
+        .iter()
+        .find(|z| z.bound.fragment_id == 2 && z.bound.start == 19_200)
+        .unwrap();
+    assert!(tail.null_count > 0);
+    assert_index_matches_scan(&dataset, VAL_FILTERS).await;
+
+    // Non-divisible target: a crossing record would mix populations, so the
+    // deleted fragments are scanned whole (live population) and keep the
+    // configured boundaries; the fully deleted tail zone of fragment 2 is
+    // not emitted by the scan.
     let (_, reports) = with_reports(create_index(
         &mut dataset,
         "val",
@@ -764,7 +638,453 @@ async fn test_seed_records_are_capped_at_the_default_zone_size() {
     ))
     .await;
     assert!(reports[0].reused_fragments.is_empty());
+    assert!(reports[0].partial_fragments.is_empty());
     assert_eq!(reports[0].scanned_fragments, vec![0, 1, 2]);
+    let zones = zone_summaries(&dataset, "val").await;
+    let mut expected: Vec<(u64, u64, usize)> = (0..3u64)
+        .flat_map(|f| target_layout(f, N as u64, 1000))
+        .collect();
+    expected.retain(|(f, start, _)| !(*f == 2 && *start == 19_000));
+    assert_eq!(layout(&zones), expected);
+    assert_index_matches_scan(&dataset, VAL_FILTERS).await;
+
+    // The same on an unseeded copy: identical layout from the scan.
+    let control_dir = TempStrDir::default();
+    let mut control = unseeded_dataset(control_dir.as_str(), 2).await;
+    control
+        .delete(&format!("id >= {} AND id < {}", N + 100, N + 150))
+        .await
+        .unwrap();
+    control
+        .delete(&format!(
+            "id >= {} OR (id >= {} AND id % 3 = 0)",
+            3 * N - 1000,
+            2 * N
+        ))
+        .await
+        .unwrap();
+    create_index(
+        &mut control,
+        "val",
+        &zone_map_params(1000, true, true),
+        None,
+    )
+    .await;
+    assert_eq!(zone_summaries(&control, "val").await, zones);
+}
+
+/// One assembly with a partial fragment, a whole-scan fragment (no seed)
+/// and a fully reused one: the mask holds the whole fragment too.
+#[tokio::test]
+async fn test_mixed_assembly_masks_partial_intervals_and_whole_fragments() {
+    let dir = TempStrDir::default();
+    let mut dataset = seeded_dataset(dir.as_str(), 64, 1, true).await;
+    dataset.drop_index(&index_name("val")).await.unwrap();
+    append(&mut dataset, 2 * N..3 * N).await; // no seed
+    create_index(&mut dataset, "val", &zone_map_params(640, true, true), None).await; // seeds 640
+    append(&mut dataset, 3 * N..4 * N).await; // 640-row seed
+    dataset.drop_index(&index_name("val")).await.unwrap();
+    // Target 1000: fragment 1 (64-row records) is partial, fragment 2 has no
+    // seed, fragment 3 (640-row records) is partial too, fragment 0 has no seed.
+    let (_, reports) = with_reports(create_index(
+        &mut dataset,
+        "val",
+        &zone_map_params(1000, true, true),
+        None,
+    ))
+    .await;
+    assert_eq!(reports[0].partial_fragments, vec![1, 3]);
+    assert_eq!(reports[0].scanned_fragments, vec![0, 1, 2, 3]);
+    assert!(reports[0].masked);
+    assert_eq!(
+        reports[0].scanned_rows,
+        2 * N as u64 + crossing_rows(N as u64, 64, 1000) + crossing_rows(N as u64, 640, 1000)
+    );
+    let control_dir = TempStrDir::default();
+    let mut control = unseeded_dataset(control_dir.as_str(), 3).await;
+    create_index(
+        &mut control,
+        "val",
+        &zone_map_params(1000, true, true),
+        None,
+    )
+    .await;
+    assert_eq!(
+        zone_summaries(&dataset, "val").await,
+        zone_summaries(&control, "val").await
+    );
+    assert_index_matches_scan(&dataset, VAL_FILTERS).await;
+}
+
+/// Legacy (V1) storage cannot take a physical mask: seeded fragments are
+/// scanned whole without a mask and statistics equal the scan.
+#[tokio::test]
+async fn test_legacy_storage_scans_without_a_mask() {
+    let dir = TempStrDir::default();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(rows(0..N))], schema()),
+        dir.as_str(),
+        Some(WriteParams {
+            max_rows_per_file: ROWS_PER_FILE,
+            data_storage_version: Some(LanceFileVersion::Legacy),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    create_index(&mut dataset, "val", &zone_map_params(64, true, true), None).await;
+    append(&mut dataset, N..2 * N).await;
+    let (_, reports) = with_reports(create_index(
+        &mut dataset,
+        "val",
+        &zone_map_params(1000, true, true),
+        None,
+    ))
+    .await;
+    assert!(!reports[0].masked);
+    assert_eq!(reports[0].scanned_fragments, vec![0, 1]);
+    assert!(reports[0].partial_fragments.is_empty());
+    let control_dir = TempStrDir::default();
+    let mut control = unseeded_dataset(control_dir.as_str(), 1).await;
+    create_index(
+        &mut control,
+        "val",
+        &zone_map_params(1000, true, true),
+        None,
+    )
+    .await;
+    assert_eq!(
+        layout(&zone_summaries(&dataset, "val").await),
+        layout(&zone_summaries(&control, "val").await)
+    );
+    // Legacy storage is not planned through the zone map; results still
+    // equal the scan.
+    for filter in VAL_FILTERS {
+        assert_eq!(
+            ids_matching(&dataset, filter, true, false).await,
+            ids_matching(&dataset, filter, false, false).await,
+            "{filter}"
+        );
+    }
+}
+
+/// Stable row ids change nothing: selection and attribution use physical
+/// row addresses.
+#[tokio::test]
+async fn test_stable_row_ids_reuse_by_physical_address() {
+    let dir = TempStrDir::default();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(rows(0..N))], schema()),
+        dir.as_str(),
+        Some(WriteParams {
+            max_rows_per_file: ROWS_PER_FILE,
+            enable_stable_row_ids: true,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    create_index(&mut dataset, "val", &zone_map_params(64, true, true), None).await;
+    append(&mut dataset, N..2 * N).await;
+    append(&mut dataset, 2 * N..3 * N).await;
+    let (_, reports) = with_reports(create_index(
+        &mut dataset,
+        "val",
+        &zone_map_params(1000, true, true),
+        None,
+    ))
+    .await;
+    assert_eq!(reports[0].partial_fragments, vec![1, 2]);
+    let control_dir = TempStrDir::default();
+    let mut control = unseeded_dataset(control_dir.as_str(), 2).await;
+    create_index(
+        &mut control,
+        "val",
+        &zone_map_params(1000, true, true),
+        None,
+    )
+    .await;
+    assert_eq!(
+        zone_summaries(&dataset, "val").await,
+        zone_summaries(&control, "val").await
+    );
+    assert_index_matches_scan(&dataset, VAL_FILTERS).await;
+}
+
+/// The null positions a seed carries, if any.
+async fn seed_positions(dataset: &Dataset, fragment_id: u64, column: &str) -> Option<Vec<u32>> {
+    use arrow_ipc::reader::FileReader as IpcReader;
+    let fragment = dataset
+        .fragments()
+        .iter()
+        .find(|f| f.id == fragment_id)
+        .unwrap()
+        .clone();
+    let reader = open_data_file(dataset, fragment.files.last().unwrap()).await;
+    let value = reader
+        .metadata()
+        .file_schema
+        .metadata
+        .get(&format!("{SEED_META_KEY_PREFIX}{column}"))?
+        .clone();
+    let buf_index: u32 = value.split(':').next().unwrap().parse().unwrap();
+    let bytes = reader.read_global_buffer(buf_index).await.unwrap();
+    let ipc = IpcReader::try_new(std::io::Cursor::new(bytes.as_ref()), None).unwrap();
+    let hex = ipc.schema().metadata.get("seed_null_bitmap")?.clone();
+    let raw: Vec<u8> = (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+        .collect();
+    if raw.is_empty() {
+        return Some(Vec::new());
+    }
+    Some(
+        RoaringBitmap::deserialize_from(raw.as_slice())
+            .unwrap()
+            .iter()
+            .collect(),
+    )
+}
+
+/// New seeds follow the index: its zone size as the record size, and its
+/// null bitmap policy; an index created without a bitmap writes counts
+/// only, and a later bitmap-keeping index scans such fragments.
+#[tokio::test]
+async fn test_seeds_follow_the_index_configuration() {
+    let dir = TempStrDir::default();
+    let mut dataset = write(dir.as_str(), 0..N).await;
+    create_index(
+        &mut dataset,
+        "val",
+        &zone_map_params(1000, true, false),
+        None,
+    )
+    .await;
+    append(&mut dataset, N..2 * N).await;
+    assert_eq!(
+        seed_locator(&dataset, 1, "val")
+            .await
+            .as_deref()
+            .unwrap()
+            .split(':')
+            .nth(1),
+        Some("1000")
+    );
+    assert!(seed_positions(&dataset, 1, "val").await.is_none());
+    let segments = index_metadata(&dataset, "val").await;
+    assert_eq!(details(&segments[0]).has_null_bitmap, Some(false));
+
+    // The bitmap-less index reuses the seed whole on update.
+    let (_, reports) = with_reports(async {
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+    })
+    .await;
+    assert_eq!(reports[0].reused_fragments, vec![1]);
+    assert_eq!(reports[0].scanned_rows, 0);
+    assert_index_matches_scan_with(&dataset, VAL_FILTERS, false).await;
+
+    // A bitmap-keeping index of the same size must scan that fragment for
+    // its positions, and its own appends then carry positions.
+    create_index(
+        &mut dataset,
+        "val",
+        &zone_map_params(1000, true, true),
+        None,
+    )
+    .await;
+    let (_, reports) = with_reports(create_index(
+        &mut dataset,
+        "val",
+        &zone_map_params(1000, true, true),
+        None,
+    ))
+    .await;
+    assert_eq!(reports[0].scanned_fragments, vec![0, 1]);
+    append(&mut dataset, 2 * N..3 * N).await;
+    let positions = seed_positions(&dataset, 2, "val").await.unwrap();
+    assert_eq!(
+        positions.len(),
+        (0..N).filter(|i| val(2 * N + i).is_none()).count()
+    );
+    let (_, reports) = with_reports(async {
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+    })
+    .await;
+    assert_eq!(reports[0].reused_fragments, vec![2]);
+    assert_index_matches_scan(&dataset, VAL_FILTERS).await;
+    let segments = index_metadata(&dataset, "val").await;
+    let index = dataset
+        .open_scalar_index("val", &segments[0].uuid, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    assert!(
+        index
+            .search(&SargableQuery::IsNull(), &NoOpMetricsCollector)
+            .await
+            .unwrap()
+            .is_exact()
+    );
+}
+
+/// Two zone maps on one column share one seed at the finer size with
+/// positions if either keeps them; each index still cuts its own zones.
+#[tokio::test]
+async fn test_two_zone_maps_on_one_column_share_the_finer_seed() {
+    let dir = TempStrDir::default();
+    let mut dataset = write(dir.as_str(), 0..N).await;
+    CreateIndexBuilder::new(
+        &mut dataset,
+        &["val"],
+        IndexType::ZoneMap,
+        &zone_map_params(640, true, false),
+    )
+    .name("coarse".to_string())
+    .await
+    .unwrap();
+    CreateIndexBuilder::new(
+        &mut dataset,
+        &["val"],
+        IndexType::ZoneMap,
+        &zone_map_params(64, true, true),
+    )
+    .name("fine".to_string())
+    .await
+    .unwrap();
+    append(&mut dataset, N..2 * N).await;
+    assert_eq!(
+        seed_locator(&dataset, 1, "val")
+            .await
+            .as_deref()
+            .unwrap()
+            .split(':')
+            .nth(1),
+        Some("64")
+    );
+    assert!(seed_positions(&dataset, 1, "val").await.is_some());
+    let (_, reports) = with_reports(async {
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+    })
+    .await;
+    // Both indexes updated from the shared seed, no scan.
+    assert_eq!(reports.len(), 2);
+    for report in &reports {
+        assert_eq!(report.reused_fragments, vec![1]);
+        assert_eq!(report.scanned_rows, 0);
+    }
+    for name in ["coarse", "fine"] {
+        let segments: Vec<IndexMetadata> = dataset
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|i| i.name == name)
+            .cloned()
+            .collect();
+        assert_eq!(segments.len(), 1);
+        let index = dataset
+            .open_scalar_index("val", &segments[0].uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let zm = index.as_any().downcast_ref::<ZoneMapIndex>().unwrap();
+        let t = if name == "coarse" { 640 } else { 64 };
+        assert_eq!(
+            layout(&zm.zone_summaries()),
+            (0..2u64)
+                .flat_map(|f| target_layout(f, N as u64, t))
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+/// A rebuild over a subset (two segments merged) goes through the
+/// metadata-aware builder: a scanned fragment keeps its configured
+/// boundaries up to its deleted tail, a fully seed-covered deleted fragment
+/// keeps its physical zones, fragments outside the request get no zones,
+/// and the committed coverage is exactly the request.
+#[tokio::test]
+async fn test_rebuild_keeps_boundaries_past_a_deleted_tail() {
+    let dir = TempStrDir::default();
+    let mut dataset = seeded_dataset(dir.as_str(), 64, 1, true).await;
+    // Fragment 1 (64-row seeds, crossing a 1,000-row boundary) loses its
+    // physical tail, so the rebuild scans it whole; fragment 2 is appended
+    // under the 1,000-row index, so its seed fits and it is reused whole.
+    dataset
+        .delete(&format!("id >= {} AND id < {}", 2 * N - 1000, 2 * N))
+        .await
+        .unwrap();
+    // Three segments: fragment 0 (replace), fragment 1 (append mode), then
+    // fragment 2 appended and indexed in append mode; merging the trailing
+    // two is a rebuild over {1, 2} with fragment 0 outside the request.
+    create_index(
+        &mut dataset,
+        "val",
+        &zone_map_params(1000, true, true),
+        Some(vec![0]),
+    )
+    .await;
+    dataset
+        .optimize_indices(&OptimizeOptions::new().num_indices_to_merge(Some(0)))
+        .await
+        .unwrap();
+    append(&mut dataset, 2 * N..3 * N).await;
+    dataset
+        .optimize_indices(&OptimizeOptions::new().num_indices_to_merge(Some(0)))
+        .await
+        .unwrap();
+    assert_eq!(index_metadata(&dataset, "val").await.len(), 3);
+    let (_, reports) = with_reports(async {
+        dataset
+            .optimize_indices(&OptimizeOptions::new().num_indices_to_merge(Some(2)))
+            .await
+            .unwrap();
+    })
+    .await;
+    let report = reports.last().unwrap();
+    assert_eq!(
+        (
+            report.partial_fragments.clone(),
+            report.scanned_fragments.clone(),
+            report.reused_fragments.clone(),
+            report.masked,
+        ),
+        (vec![], vec![1], vec![2], true),
+        "{report:?}"
+    );
+    let segments = index_metadata(&dataset, "val").await;
+    assert_eq!(segments.len(), 2);
+    let merged = segments
+        .iter()
+        .find(|s| coverage(s) == RoaringBitmap::from_iter([1u32, 2]))
+        .expect("the rebuilt segment covers exactly {1, 2}");
+    let index = dataset
+        .open_scalar_index("val", &merged.uuid, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    let mut zones = index
+        .as_any()
+        .downcast_ref::<ZoneMapIndex>()
+        .unwrap()
+        .zone_summaries();
+    zones.sort_by_key(|z| (z.bound.fragment_id, z.bound.start));
+    let mut expected: Vec<(u64, u64, usize)> = (1..3u64)
+        .flat_map(|f| target_layout(f, N as u64, 1000))
+        .collect();
+    assert!(zones.iter().all(|z| z.bound.fragment_id != 0));
+    // Fragment 1 is scanned whole (a deleted fragment with crossing records):
+    // its zones keep the configured boundaries, and its last zone, whose
+    // rows [19000, 20000) are all deleted, is not emitted. Fragment 2 keeps
+    // every zone from its seed.
+    expected.retain(|(f, start, _)| !(*f == 1 && *start == 19_000));
+    assert_eq!(layout(&zones), expected);
     assert_index_matches_scan(&dataset, VAL_FILTERS).await;
 }
 

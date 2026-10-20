@@ -7,6 +7,8 @@
 //! It handles chunking data streams into fixed-size zones while respecting fragment
 //! boundaries and computing zone bounds that remain valid after row deletions.
 
+use std::collections::HashMap;
+
 use arrow_array::{ArrayRef, UInt64Array};
 use datafusion::execution::SendableRecordBatchStream;
 use futures::TryStreamExt;
@@ -66,6 +68,11 @@ pub struct ZoneTrainer<P> {
     /// keep only per-zone counts, so the scan does not build a bitmap it will
     /// discard.
     track_null_rows: bool,
+    /// Physical-offset alignment: when set, zone `k` of a fragment is exactly
+    /// the offsets `[k * capacity, (k + 1) * capacity)`, and the map gives the
+    /// fragment's physical row count so the last zone's length is known even
+    /// when its trailing rows are deleted or outside the scanned selection.
+    aligned: Option<HashMap<u64, u64>>,
 }
 
 impl<P> ZoneTrainer<P>
@@ -83,7 +90,19 @@ where
             processor,
             zone_capacity,
             track_null_rows: true,
+            aligned: None,
         })
+    }
+
+    /// Cut zones at fixed physical offsets instead of counting rows:
+    /// zone `k` of a fragment spans `[k * capacity, min((k + 1) * capacity, P))`
+    /// where `P` is that fragment's entry in `physical_rows`. A fragment
+    /// missing from the map falls back to the span up to its last scanned
+    /// row for its final zone. Rows of a zone with no scanned rows produce
+    /// no zone. Fragments must still arrive grouped and in offset order.
+    pub fn aligned_to(mut self, physical_rows: HashMap<u64, u64>) -> Self {
+        self.aligned = Some(physical_rows);
+        self
     }
 
     /// Enable or disable per-row null address tracking. When disabled the
@@ -116,6 +135,9 @@ where
         let mut current_zone_len: usize = 0;
         let mut zone_start_offset: Option<u64> = None;
         let mut zone_end_offset: Option<u64> = None;
+        // Aligned mode: the zone index of the rows being accumulated.
+        let mut current_zone_index: Option<u64> = None;
+        let capacity = self.zone_capacity;
 
         self.processor.reset()?;
 
@@ -137,33 +159,43 @@ where
                 let row_addr = row_addr_col.value(batch_offset);
                 let fragment_id = row_addr >> 32;
 
-                // Zones cannot span fragments; flush current zone (if non-empty) at boundary
-                match current_fragment_id {
-                    Some(current) if current != fragment_id => {
-                        if current_zone_len > 0 {
-                            Self::flush_zone(
-                                &mut self.processor,
-                                &mut zones,
-                                current,
-                                &mut current_zone_len,
-                                &mut zone_start_offset,
-                                &mut zone_end_offset,
-                            )?;
-                        }
-                        current_fragment_id = Some(fragment_id);
-                    }
-                    None => {
-                        current_fragment_id = Some(fragment_id);
-                    }
-                    _ => {}
-                }
+                let zone_index = RowAddress::new_from_u64(row_addr).row_offset() as u64 / capacity;
 
-                // Count consecutive rows in the same fragment
+                // Zones cannot span fragments; flush current zone (if non-empty) at boundary.
+                // In aligned mode a change of zone index flushes too.
+                let boundary = match current_fragment_id {
+                    Some(current) if current != fragment_id => true,
+                    Some(_) => self.aligned.is_some() && current_zone_index != Some(zone_index),
+                    None => false,
+                };
+                if boundary && current_zone_len > 0 {
+                    Self::flush_zone(
+                        &mut self.processor,
+                        &mut zones,
+                        current_fragment_id.unwrap(),
+                        &mut current_zone_len,
+                        &mut zone_start_offset,
+                        &mut zone_end_offset,
+                        self.aligned
+                            .as_ref()
+                            .map(|rows| (current_zone_index.unwrap(), capacity, rows)),
+                    )?;
+                }
+                current_fragment_id = Some(fragment_id);
+                current_zone_index = Some(zone_index);
+
+                // Count consecutive rows in the same fragment (and, aligned, the same zone)
                 let run_len = (batch_offset..batch.num_rows())
-                    .take_while(|&idx| (row_addr_col.value(idx) >> 32) == fragment_id)
+                    .take_while(|&idx| {
+                        let addr = row_addr_col.value(idx);
+                        (addr >> 32) == fragment_id
+                            && (self.aligned.is_none()
+                                || RowAddress::new_from_u64(addr).row_offset() as u64 / capacity
+                                    == zone_index)
+                    })
                     .count();
-                let capacity = zone_size - current_zone_len;
-                let take = run_len.min(capacity);
+                let room = zone_size - current_zone_len;
+                let take = run_len.min(room);
 
                 self.processor
                     .process_chunk(&values.slice(batch_offset, take))?;
@@ -203,6 +235,9 @@ where
                         &mut current_zone_len,
                         &mut zone_start_offset,
                         &mut zone_end_offset,
+                        self.aligned
+                            .as_ref()
+                            .map(|rows| (zone_index, capacity, rows)),
                     )?;
                 }
             }
@@ -217,6 +252,9 @@ where
                     &mut current_zone_len,
                     &mut zone_start_offset,
                     &mut zone_end_offset,
+                    self.aligned
+                        .as_ref()
+                        .map(|rows| (current_zone_index.unwrap(), capacity, rows)),
                 )?;
             } else {
                 self.processor.reset()?;
@@ -226,7 +264,9 @@ where
         Ok((zones, null_rows))
     }
 
-    /// Flushes a non-empty zone and resets the processor state.
+    /// Flushes a non-empty zone and resets the processor state. `aligned`
+    /// carries `(zone index, capacity, physical rows by fragment)` when the
+    /// zone's bound is fixed by offset rather than by the rows seen.
     fn flush_zone(
         processor: &mut P,
         zones: &mut Vec<P::ZoneStatistics>,
@@ -234,6 +274,7 @@ where
         current_zone_len: &mut usize,
         zone_start_offset: &mut Option<u64>,
         zone_end_offset: &mut Option<u64>,
+        aligned: Option<(u64, u64, &HashMap<u64, u64>)>,
     ) -> Result<()> {
         let start = zone_start_offset.unwrap_or(0);
         let inferred_end =
@@ -241,10 +282,24 @@ where
         if inferred_end < start {
             return Err(Error::invalid_input("zone row offsets are out of order"));
         }
-        let bound = ZoneBound {
-            fragment_id,
-            start,
-            length: (inferred_end - start + 1) as usize,
+        let bound = match aligned {
+            Some((zone_index, capacity, physical_rows)) => {
+                let start = zone_index * capacity;
+                let end = match physical_rows.get(&fragment_id) {
+                    Some(rows) => (start + capacity).min(*rows),
+                    None => inferred_end + 1,
+                };
+                ZoneBound {
+                    fragment_id,
+                    start,
+                    length: (end - start) as usize,
+                }
+            }
+            None => ZoneBound {
+                fragment_id,
+                start,
+                length: (inferred_end - start + 1) as usize,
+            },
         };
         let stats = processor.finish_zone(bound)?;
         zones.push(stats);
