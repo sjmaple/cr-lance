@@ -1203,3 +1203,187 @@ async fn test_overlaid_fragment_is_scanned_instead_of_reused() {
     );
     assert_index_matches_scan(&dataset, VAL_FILTERS).await;
 }
+
+/// Historical availability is not configuration: an index whose details say
+/// `has_null_bitmap = false` but whose file carries no explicit
+/// `store_null_bitmap = false` (a legacy segment, or one updated or merged
+/// from a legacy segment) keeps the default policy, so the seeds written
+/// for it carry null positions.
+#[tokio::test]
+async fn test_historical_index_without_bitmap_still_collects_seed_positions() {
+    use std::collections::HashMap;
+
+    use arrow_array::{UInt32Array, UInt64Array};
+    use lance_index::scalar::lance_format::LanceIndexStore;
+    use lance_index::scalar::zonemap::ZONEMAP_INDEX_FILENAME;
+    use lance_index::scalar::{IndexStore, index_files_to_table};
+    use uuid::Uuid;
+
+    use crate::dataset::index::LanceIndexStoreExt;
+    use crate::index::scalar::zonemap::stored_null_bitmap_policy;
+
+    let dir = TempStrDir::default();
+    let mut dataset = write(dir.as_str(), 0..N).await;
+
+    // Hand-write a legacy-style segment: one zone over fragment 0, no null
+    // bitmap buffer, no policy key, details with `has_null_bitmap: false`
+    // and seeds enabled.
+    let values: Vec<i64> = (0..N).filter_map(val).collect();
+    let null_count = (0..N).filter(|i| val(*i).is_none()).count() as u32;
+    let uuid = Uuid::new_v4();
+    let store = LanceIndexStore::from_dataset_for_new(&dataset, &uuid).unwrap();
+    let mut file_schema = ArrowSchema::new(vec![
+        ArrowField::new("min", DataType::Int64, true),
+        ArrowField::new("max", DataType::Int64, true),
+        ArrowField::new("null_count", DataType::UInt32, false),
+        ArrowField::new("nan_count", DataType::UInt32, false),
+        ArrowField::new("fragment_id", DataType::UInt64, false),
+        ArrowField::new("zone_start", DataType::UInt64, false),
+        ArrowField::new("zone_length", DataType::UInt64, false),
+    ]);
+    file_schema
+        .metadata
+        .insert("rows_per_zone".to_string(), N.to_string());
+    let file_schema = Arc::new(file_schema);
+    let batch = RecordBatch::try_new(
+        file_schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![*values.iter().min().unwrap()])),
+            Arc::new(Int64Array::from(vec![*values.iter().max().unwrap()])),
+            Arc::new(UInt32Array::from(vec![null_count])),
+            Arc::new(UInt32Array::from(vec![0u32])),
+            Arc::new(UInt64Array::from(vec![0u64])),
+            Arc::new(UInt64Array::from(vec![0u64])),
+            Arc::new(UInt64Array::from(vec![N as u64])),
+        ],
+    )
+    .unwrap();
+    let mut file = store
+        .new_index_file(ZONEMAP_INDEX_FILENAME, file_schema)
+        .await
+        .unwrap();
+    file.write_record_batch(batch).await.unwrap();
+    let index_file = file.finish_with_metadata(HashMap::new()).await.unwrap();
+    let legacy_details = prost_types::Any::from_msg(&pbold::ZoneMapIndexDetails {
+        rows_per_zone: Some(N as u64),
+        use_seeds: Some(true),
+        has_null_bitmap: Some(false),
+    })
+    .unwrap();
+    let segment = IndexMetadata {
+        uuid,
+        fields: vec![dataset.schema().field("val").unwrap().id],
+        covering_fields: vec![],
+        name: index_name("val"),
+        dataset_version: dataset.version().version,
+        fragment_bitmap: Some(RoaringBitmap::from_iter([0u32])),
+        index_details: Some(Arc::new(legacy_details)),
+        index_version: 0,
+        created_at: Some(chrono::Utc::now()),
+        base_id: None,
+        files: Some(index_files_to_table(vec![index_file])),
+    };
+    dataset
+        .commit_existing_index_segments(&index_name("val"), "val", vec![segment])
+        .await
+        .unwrap();
+    let segments = index_metadata(&dataset, "val").await;
+    assert_eq!(details(&segments[0]).has_null_bitmap, Some(false));
+    assert!(
+        stored_null_bitmap_policy(&dataset, &segments[0])
+            .await
+            .unwrap()
+    );
+
+    // The appended fragment's seed carries positions: availability did not
+    // turn the default off.
+    append(&mut dataset, N..2 * N).await;
+    let positions = seed_positions(&dataset, 1, "val").await.unwrap();
+    assert_eq!(
+        positions.len(),
+        (0..N).filter(|i| val(N + i).is_none()).count()
+    );
+
+    // The index stays bitmap-less (nothing can recover fragment 0's
+    // positions) and still reuses the seed's counts.
+    let (_, reports) = with_reports(async {
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+    })
+    .await;
+    assert_eq!(reports[0].reused_fragments, vec![1]);
+    let segments = index_metadata(&dataset, "val").await;
+    assert_eq!(details(&segments[0]).has_null_bitmap, Some(false));
+    assert_index_matches_scan_with(&dataset, VAL_FILTERS, false).await;
+}
+
+/// The policy lookup costs one index-file footer read per ZoneMap segment
+/// on a cold handle and none once the file metadata is cached; several
+/// segments of one index still produce one seed writer.
+#[tokio::test]
+async fn test_seed_collector_policy_lookup_cost() {
+    use lance_file::version::ConcreteFileVersion;
+
+    use crate::dataset::write::seeds::SeedCollector;
+
+    async fn index_requests(dataset: &Dataset) -> usize {
+        io(dataset)
+            .requests
+            .iter()
+            .filter(|r| r.path.to_string().contains("_indices"))
+            .count()
+    }
+    async fn writers_and_requests(dataset: &Dataset) -> (usize, usize) {
+        io(dataset);
+        let collector = SeedCollector::for_write(
+            ConcreteFileVersion::V2_0,
+            Some(dataset),
+            dataset.schema(),
+            true,
+        )
+        .await
+        .unwrap();
+        (collector.len(), index_requests(dataset).await)
+    }
+
+    let dir = TempStrDir::default();
+    let mut dataset = write(dir.as_str(), 0..N).await;
+    create_index(
+        &mut dataset,
+        "val",
+        &zone_map_params(1000, true, true),
+        None,
+    )
+    .await;
+
+    // Cold handle: one segment, one footer read; warm: none.
+    let dataset = Dataset::open(dir.as_str()).await.unwrap();
+    let (writers, cold) = writers_and_requests(&dataset).await;
+    assert_eq!(writers, 1);
+    assert!(
+        (1..=2).contains(&cold),
+        "cold lookup read the index file {cold} times"
+    );
+    let (writers, warm) = writers_and_requests(&dataset).await;
+    assert_eq!((writers, warm), (1, 0));
+
+    // Two segments of the same index: one lookup each, still one writer.
+    let mut dataset = dataset;
+    append(&mut dataset, N..2 * N).await;
+    dataset
+        .optimize_indices(&OptimizeOptions::new().num_indices_to_merge(Some(0)))
+        .await
+        .unwrap();
+    assert_eq!(index_metadata(&dataset, "val").await.len(), 2);
+    let dataset = Dataset::open(dir.as_str()).await.unwrap();
+    let (writers, cold) = writers_and_requests(&dataset).await;
+    assert_eq!(writers, 1);
+    assert!(
+        (2..=4).contains(&cold),
+        "two segments read {cold} times cold"
+    );
+    let (writers, warm) = writers_and_requests(&dataset).await;
+    assert_eq!((writers, warm), (1, 0));
+}
