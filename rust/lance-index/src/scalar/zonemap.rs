@@ -1883,6 +1883,7 @@ impl ZoneMapSeedWriter {
     /// Returns zone statistics (bounds reconstructed from sequential fragment layout) and an
     /// optional `RoaringBitmap` of null row offsets within the fragment. The bitmap is absent
     /// for seeds written by older code that did not track null positions.
+    #[cfg(test)]
     pub(crate) fn deserialize_seed(
         fragment_id: u64,
         bytes: &bytes::Bytes,
@@ -2171,8 +2172,49 @@ pub struct ReusedZones {
 }
 
 impl ReusedZones {
+    /// An empty accumulator; `need_null_positions` must match the index
+    /// the zones are built into (see [`build_zonemap_segment`]).
+    pub fn new(need_null_positions: bool) -> Self {
+        Self {
+            with_null_positions: need_null_positions,
+            ..Default::default()
+        }
+    }
+
     pub fn num_zones(&self) -> usize {
         self.zones.len()
+    }
+
+    /// Validate and fold one fragment's seed (see [`reuse_zone_seeds`]),
+    /// consuming its raw bytes. Returns whether the fragment was reused; a
+    /// rejected fragment is recorded for scanning.
+    pub fn reuse(
+        &mut self,
+        harvested: &HarvestedZoneSeed,
+        rows_per_zone: u64,
+        data_type: &DataType,
+    ) -> Result<bool> {
+        if rows_per_zone == 0 {
+            return Err(Error::invalid_input(
+                "rows_per_zone must be greater than zero",
+            ));
+        }
+        let fragment_id = harvested.seed.fragment_id;
+        match validated_seed_zones(
+            harvested,
+            rows_per_zone,
+            data_type,
+            self.with_null_positions,
+        ) {
+            Some(validated) => {
+                self.add(fragment_id, validated, rows_per_zone, data_type)?;
+                Ok(true)
+            }
+            None => {
+                self.rejected_fragments.push(fragment_id);
+                Ok(false)
+            }
+        }
     }
 
     fn add(
@@ -2227,16 +2269,9 @@ pub fn reuse_zone_seeds(
             "rows_per_zone must be greater than zero",
         ));
     }
-    let mut reused = ReusedZones {
-        with_null_positions: need_null_positions,
-        ..Default::default()
-    };
+    let mut reused = ReusedZones::new(need_null_positions);
     for harvested in seeds {
-        let fragment_id = harvested.seed.fragment_id;
-        match validated_seed_zones(harvested, rows_per_zone, data_type, need_null_positions) {
-            Some(validated) => reused.add(fragment_id, validated, rows_per_zone, data_type)?,
-            None => reused.rejected_fragments.push(fragment_id),
-        }
+        reused.reuse(harvested, rows_per_zone, data_type)?;
     }
     Ok(reused)
 }

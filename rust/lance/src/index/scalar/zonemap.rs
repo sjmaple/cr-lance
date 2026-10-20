@@ -9,8 +9,8 @@ use itertools::Itertools;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::zonemap::{
-    HarvestedZoneSeed, ZoneMapIndex, ZoneMapIndexBuilderParams, ZoneMapSegmentBase,
-    build_zonemap_segment, reuse_zone_seeds,
+    HarvestedZoneSeed, ReusedZones, ZoneMapIndex, ZoneMapIndexBuilderParams, ZoneMapSegmentBase,
+    build_zonemap_segment,
 };
 use lance_index::scalar::{
     CreatedIndex, IndexStore, ScalarIndex, TrainingCriteria, index_files_to_table,
@@ -111,6 +111,10 @@ pub struct SeedReuseReport {
     pub reused_records: usize,
     pub zones_from_seeds: usize,
     pub scanned_fragments: Vec<u64>,
+    /// Largest raw seed buffer held at any moment during the build.
+    pub max_live_seed_bytes: usize,
+    /// Raw seed bytes harvested over the whole build.
+    pub total_seed_bytes: usize,
 }
 
 #[cfg(test)]
@@ -119,30 +123,13 @@ tokio::task_local! {
     pub static SEED_REUSE_REPORTS: std::sync::Mutex<Vec<SeedReuseReport>>;
 }
 
-/// The seeds `fragments` carry for the column, with the physical row count
-/// each seed must account for. Fragments without a verifiable seed, or
-/// without a known physical row count, are left out and get scanned.
-async fn harvest_zone_seeds(
-    mut harvester: SeedHarvester<'_>,
-    fragments: &[Fragment],
-) -> Result<Vec<HarvestedZoneSeed>> {
-    let mut seeds = Vec::new();
-    for fragment in fragments {
-        let Some(physical_rows) = fragment.physical_rows else {
-            continue;
-        };
-        if let Some(seed) = harvester.harvest(fragment).await? {
-            seeds.push(HarvestedZoneSeed {
-                seed,
-                physical_rows: physical_rows as u64,
-            });
-        }
-    }
-    Ok(seeds)
-}
-
 /// Fold the usable seeds into zones, scan the remaining fragments, and write
 /// one segment.
+///
+/// Seeds are harvested, validated and folded one fragment at a time, so the
+/// raw seed buffer held in memory is at most one fragment's, whatever the
+/// table size; only the packed zones (and, when kept, null positions)
+/// accumulate.
 #[allow(clippy::too_many_arguments)]
 async fn assemble_segment(
     dataset: &Dataset,
@@ -150,16 +137,34 @@ async fn assemble_segment(
     base: ZoneMapSegmentBase<'_>,
     data_type: &DataType,
     fragments: &[Fragment],
-    seeds: Vec<HarvestedZoneSeed>,
+    harvester: Option<SeedHarvester<'_>>,
     criteria: &TrainingCriteria,
     store: &dyn IndexStore,
 ) -> Result<CreatedIndex> {
-    let reused = reuse_zone_seeds(
-        &seeds,
-        base.rows_per_zone(),
-        data_type,
-        base.keeps_null_positions(),
-    )?;
+    let mut reused = ReusedZones::new(base.keeps_null_positions());
+    let (mut max_live_seed_bytes, mut total_seed_bytes) = (0usize, 0usize);
+    if let Some(mut harvester) = harvester {
+        for fragment in fragments {
+            // Without a known physical row count the seed's coverage cannot
+            // be verified; the fragment is scanned.
+            let Some(physical_rows) = fragment.physical_rows else {
+                continue;
+            };
+            let Some(seed) = harvester.harvest(fragment).await? else {
+                continue;
+            };
+            let harvested = HarvestedZoneSeed {
+                seed,
+                physical_rows: physical_rows as u64,
+            };
+            let bytes = harvested.seed.bytes.len();
+            max_live_seed_bytes = max_live_seed_bytes.max(bytes);
+            total_seed_bytes += bytes;
+            reused.reuse(&harvested, base.rows_per_zone(), data_type)?;
+            // `harvested` is dropped here: the raw buffer does not outlive
+            // its fragment's fold.
+        }
+    }
     let reused_ids: HashSet<u64> = reused.reused_fragments.iter().copied().collect();
     let to_scan: Vec<Fragment> = fragments
         .iter()
@@ -167,7 +172,7 @@ async fn assemble_segment(
         .cloned()
         .collect();
     log::info!(
-        "zone map segment for {column}: {} fragments from {} seed records, {} fragments scanned",
+        "zone map segment for {column}: {} fragments from {} seed records ({total_seed_bytes} seed bytes, at most {max_live_seed_bytes} held at once), {} fragments scanned",
         reused.reused_fragments.len(),
         reused.reused_records,
         to_scan.len()
@@ -179,6 +184,8 @@ async fn assemble_segment(
             reused_records: reused.reused_records,
             zones_from_seeds: reused.num_zones(),
             scanned_fragments: to_scan.iter().map(|fragment| fragment.id).collect(),
+            max_live_seed_bytes,
+            total_seed_bytes,
         })
     });
     let scan = if to_scan.is_empty() {
@@ -216,17 +223,13 @@ pub(in crate::index) async fn build_segment_with_seeds(
         }
         None => dataset.fragments().as_ref().clone(),
     };
-    let seeds = match SeedHarvester::for_column(dataset, column) {
-        Some(harvester) => harvest_zone_seeds(harvester, &fragments).await?,
-        None => Vec::new(),
-    };
     assemble_segment(
         dataset,
         column,
         ZoneMapSegmentBase::New(params),
         data_type,
         &fragments,
-        seeds,
+        SeedHarvester::for_column(dataset, column),
         criteria,
         store,
     )
@@ -256,7 +259,6 @@ pub(in crate::index) async fn update_segment_with_seeds(
     else {
         return Ok(None);
     };
-    let seeds = harvest_zone_seeds(harvester, unindexed).await?;
     let data_type = zone_map.value_type().clone();
     assemble_segment(
         dataset,
@@ -264,7 +266,7 @@ pub(in crate::index) async fn update_segment_with_seeds(
         ZoneMapSegmentBase::Update(zone_map),
         &data_type,
         unindexed,
-        seeds,
+        Some(harvester),
         criteria,
         store,
     )
