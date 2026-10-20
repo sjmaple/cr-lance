@@ -15,7 +15,8 @@
 //! can contribute to the externally measured peak RSS.
 //! ZONEMAP_UPDATE_DIRECTORY writes an empty-data update there and measures the
 //! maintenance peak separately from queries.
-//! ZONEMAP_QUERY selects one query (miss, selective, null, broad).
+//! ZONEMAP_QUERY selects comma-separated queries (miss, selective, null, broad).
+//! Searches and value_range each have one untimed warmup and 11 timed samples.
 
 #![allow(clippy::print_stdout)]
 
@@ -44,6 +45,7 @@ use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
 
 const ROWS_PER_ZONE: u64 = 1_000_000;
+const TIMED_SAMPLES: usize = 11;
 
 struct TrackingAllocator;
 
@@ -256,6 +258,17 @@ fn rss_bytes() -> Option<u64> {
         .map(|kb| kb * 1024)
 }
 
+fn summarize(samples: Vec<f64>) -> serde_json::Value {
+    let mut ordered = samples.clone();
+    ordered.sort_by(f64::total_cmp);
+    serde_json::json!({
+        "median_ms": ordered[ordered.len() / 2],
+        "min_ms": ordered[0],
+        "max_ms": ordered[ordered.len() - 1],
+        "samples_ms": samples,
+    })
+}
+
 #[tokio::main]
 async fn main() {
     let options = Options::from_env();
@@ -345,11 +358,18 @@ async fn main() {
         options
             .query
             .as_deref()
-            .is_none_or(|chosen| chosen == *name)
+            .is_none_or(|chosen| chosen.split(',').any(|selected| selected == *name))
     }) {
-        let mut samples = Vec::with_capacity(11);
-        let mut result_size = 0;
-        for _ in 0..11 {
+        let warmup = black_box(
+            index
+                .search(black_box(&query), &NoOpMetricsCollector)
+                .await
+                .unwrap(),
+        );
+        let result_size = warmup.row_addrs().selected_rows().deep_size_of();
+        drop(warmup);
+        let mut samples = Vec::with_capacity(TIMED_SAMPLES);
+        for _ in 0..TIMED_SAMPLES {
             let started = Instant::now();
             let result = black_box(
                 index
@@ -358,17 +378,24 @@ async fn main() {
                     .unwrap(),
             );
             samples.push(started.elapsed().as_secs_f64() * 1000.0);
-            if result_size == 0 {
-                result_size = result.row_addrs().selected_rows().deep_size_of();
-            }
+            drop(result);
         }
-        samples.sort_by(f64::total_cmp);
-        measurements.push(serde_json::json!({"query": name, "median_ms": samples[5], "min_ms": samples[0], "max_ms": samples[10], "result_bytes": result_size}));
+        let mut measurement = summarize(samples);
+        measurement["query"] = serde_json::json!(name);
+        measurement["result_bytes"] = serde_json::json!(result_size);
+        measurements.push(measurement);
     }
-    let started = Instant::now();
     black_box(index.value_range());
-    let value_range_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let mut samples = Vec::with_capacity(TIMED_SAMPLES);
+    for _ in 0..TIMED_SAMPLES {
+        let started = Instant::now();
+        let result = black_box(index.value_range());
+        samples.push(started.elapsed().as_secs_f64() * 1000.0);
+        drop(result);
+    }
+    let value_range = summarize(samples);
+    report["value_range_ms"] = value_range["median_ms"].clone();
+    report["value_range"] = value_range;
     report["queries"] = serde_json::json!(measurements);
-    report["value_range_ms"] = serde_json::json!(value_range_ms);
     println!("{report}");
 }
