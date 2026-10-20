@@ -257,12 +257,27 @@ where
     T: AsRef<ZoneBound>,
     F: FnMut(&T) -> Result<bool>,
 {
+    search_zone_iter(zones, metrics, |zone| zone_matches(zone))
+}
+
+pub(crate) fn search_zone_iter<T, I, F>(
+    zones: I,
+    metrics: &dyn crate::metrics::MetricsCollector,
+    mut zone_matches: F,
+) -> Result<crate::scalar::SearchResult>
+where
+    T: AsRef<ZoneBound>,
+    I: IntoIterator<Item = T>,
+    I::IntoIter: ExactSizeIterator,
+    F: FnMut(&T) -> Result<bool>,
+{
+    let zones = zones.into_iter();
     metrics.record_comparisons(zones.len());
     let mut row_addr_tree_map = RowAddrTreeMap::new();
 
     // For each zone, check if it might contain the queried value
     for zone in zones {
-        if zone_matches(zone)? {
+        if zone_matches(&zone)? {
             let bound = zone.as_ref();
             // Calculate the range of row addresses for this zone
             let zone_start_addr = (bound.fragment_id << 32) + bound.start;
