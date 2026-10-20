@@ -111,7 +111,8 @@ pub struct SeedReuseReport {
     pub reused_records: usize,
     pub zones_from_seeds: usize,
     pub scanned_fragments: Vec<u64>,
-    /// Largest raw seed buffer held at any moment during the build.
+    /// Most raw seed bytes owned by the build at any one moment (live
+    /// ownership, decremented when a fragment's buffer is dropped).
     pub max_live_seed_bytes: usize,
     /// Raw seed bytes harvested over the whole build.
     pub total_seed_bytes: usize,
@@ -142,7 +143,9 @@ async fn assemble_segment(
     store: &dyn IndexStore,
 ) -> Result<CreatedIndex> {
     let mut reused = ReusedZones::new(base.keeps_null_positions());
-    let (mut max_live_seed_bytes, mut total_seed_bytes) = (0usize, 0usize);
+    // Raw seed bytes owned by this build right now, and the most ever owned.
+    let (mut live_seed_bytes, mut max_live_seed_bytes, mut total_seed_bytes) =
+        (0usize, 0usize, 0usize);
     if let Some(mut harvester) = harvester {
         for fragment in fragments {
             // Without a known physical row count the seed's coverage cannot
@@ -158,11 +161,15 @@ async fn assemble_segment(
                 physical_rows: physical_rows as u64,
             };
             let bytes = harvested.seed.bytes.len();
-            max_live_seed_bytes = max_live_seed_bytes.max(bytes);
+            live_seed_bytes += bytes;
+            max_live_seed_bytes = max_live_seed_bytes.max(live_seed_bytes);
             total_seed_bytes += bytes;
             reused.reuse(&harvested, base.rows_per_zone(), data_type)?;
-            // `harvested` is dropped here: the raw buffer does not outlive
-            // its fragment's fold.
+            // The raw buffer does not outlive its fragment's fold. The
+            // explicit drop keeps the live count honest: moving `harvested`
+            // anywhere else would not compile past it.
+            drop(harvested);
+            live_seed_bytes -= bytes;
         }
     }
     let reused_ids: HashSet<u64> = reused.reused_fragments.iter().copied().collect();

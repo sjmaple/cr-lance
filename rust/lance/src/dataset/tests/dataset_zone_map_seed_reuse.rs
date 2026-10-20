@@ -411,8 +411,8 @@ async fn test_create_index_packs_smaller_seed_records_into_large_zones() {
     assert_eq!(reports[0].reused_records, 5 * (N as usize / 64 + 1));
     assert_eq!(reports[0].zones_from_seeds, 5);
     assert_eq!(reports[0].scanned_fragments, vec![0]);
-    // Raw seed buffers are held one fragment at a time: the largest live
-    // buffer is one seed, far below the five seeds harvested in total.
+    // Raw seed buffers are owned one fragment at a time: the most ever
+    // owned at once is one seed, far below the five harvested in total.
     assert!(reports[0].max_live_seed_bytes > 0);
     assert!(
         reports[0].max_live_seed_bytes * 4 <= reports[0].total_seed_bytes,

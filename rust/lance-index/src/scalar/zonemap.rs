@@ -2185,9 +2185,10 @@ impl ReusedZones {
         self.zones.len()
     }
 
-    /// Validate and fold one fragment's seed (see [`reuse_zone_seeds`]),
-    /// consuming its raw bytes. Returns whether the fragment was reused; a
-    /// rejected fragment is recorded for scanning.
+    /// Validate and fold one fragment's seed (see [`reuse_zone_seeds`]).
+    /// Only the packed zones and, when kept, null positions are retained;
+    /// the borrowed raw bytes are the caller's to release. Returns whether
+    /// the fragment was reused; a rejected fragment is recorded for scanning.
     pub fn reuse(
         &mut self,
         harvested: &HarvestedZoneSeed,
